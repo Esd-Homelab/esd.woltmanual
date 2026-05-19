@@ -279,6 +279,16 @@ textarea {
   flex-wrap: wrap;
 }
 
+.provider-switch {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.provider-switch button {
+  min-height: 44px;
+}
+
 .error {
   border: 1px solid rgba(255, 111, 111, 0.45);
   border-radius: 6px;

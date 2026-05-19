@@ -10,6 +10,9 @@ const CONFIG_PATH = path.join(ROOT_DIR, "config.json");
 const ACCOUNTS_PATH = path.join(ROOT_DIR, "accounts.json");
 const HERO_BASE = "https://hero-sms.com/stubs/handler_api.php";
 const TESTMAIL_BASE = "https://api.testmail.app/api/json";
+const DEFAULT_EMAIL_PROVIDER = "testmail";
+const RAPIDAPI_TEMPMAIL_HOST = "privatix-temp-mail-v1.p.rapidapi.com";
+const RAPIDAPI_TEMPMAIL_BASE = `https://${RAPIDAPI_TEMPMAIL_HOST}`;
 const WOLT_SERVICE = "rr";
 const PORT = Number(process.env.PORT || 5137);
 const WOLT_URL = "https://wolt.com";
@@ -106,11 +109,37 @@ function cleanConfigJson(text) {
 async function loadConfig() {
   const text = await fs.readFile(CONFIG_PATH, "utf8");
   const parsed = JSON.parse(cleanConfigJson(text));
+  return normalizeConfig(parsed);
+}
+
+function normalizeConfig(parsed) {
+  const defaultEmailProvider = getEmailProvider({
+    email_provider: parsed.default_email_provider || parsed.email_provider
+  });
   return {
     sms_api_key: String(parsed.sms_api_key || "").trim(),
+    default_email_provider: defaultEmailProvider,
+    email_provider: defaultEmailProvider,
     testmail_api_key: String(parsed.testmail_api_key || "").trim(),
-    testmail_namespace: String(parsed.testmail_namespace || "").trim()
+    testmail_namespace: String(parsed.testmail_namespace || "").trim(),
+    tempmail_api_key: String(parsed.tempmail_api_key || process.env.TEMPMAIL_API_KEY || "").trim(),
+    tempmail_domain: String(parsed.tempmail_domain || "").trim()
   };
+}
+
+async function updateConfig(fields) {
+  const text = await fs.readFile(CONFIG_PATH, "utf8");
+  const parsed = JSON.parse(cleanConfigJson(text));
+  const next = { ...parsed };
+  if (fields.default_email_provider !== undefined || fields.email_provider !== undefined) {
+    const provider = getEmailProvider({
+      email_provider: String(fields.default_email_provider || fields.email_provider || "").trim().toLowerCase()
+    });
+    next.default_email_provider = provider;
+    next.email_provider = provider;
+  }
+  await fs.writeFile(CONFIG_PATH, `${JSON.stringify(next, null, 2)}\n`, "utf8");
+  return normalizeConfig(next);
 }
 
 function missingKeys(config, keys) {
@@ -118,18 +147,34 @@ function missingKeys(config, keys) {
 }
 
 function publicConfig(config) {
-  const missing = missingKeys(config, [
-    "sms_api_key",
-    "testmail_api_key",
-    "testmail_namespace"
-  ]);
+  const emailProvider = getEmailProvider(config);
+  const tempmailDomain = config.tempmail_domain === RAPIDAPI_TEMPMAIL_HOST ? "" : config.tempmail_domain;
+  const missing = [
+    ...missingKeys(config, ["sms_api_key"]),
+    ...missingEmailConfig(config)
+  ];
   return {
     success: true,
+    default_email_provider: emailProvider,
+    email_provider: emailProvider,
     testmail_namespace: config.testmail_namespace,
+    tempmail_domain: tempmailDomain,
+    email_label: emailProvider === "tempmail" ? (tempmailDomain || "tempmail") : config.testmail_namespace,
     has_sms_api_key: Boolean(config.sms_api_key),
     has_testmail_api_key: Boolean(config.testmail_api_key),
+    has_tempmail_api_key: Boolean(config.tempmail_api_key),
     missing
   };
+}
+
+function getEmailProvider(config) {
+  return config.email_provider === "tempmail" ? "tempmail" : DEFAULT_EMAIL_PROVIDER;
+}
+
+function missingEmailConfig(config) {
+  return getEmailProvider(config) === "tempmail"
+    ? missingKeys(config, ["tempmail_api_key"])
+    : missingKeys(config, ["testmail_api_key", "testmail_namespace"]);
 }
 
 async function fetchWithTimeout(url, options = {}, timeoutMs = 15000) {
@@ -460,10 +505,68 @@ async function fetchTestmailEmails(config, limit = 10, offset = 0) {
   return result.json || {};
 }
 
-function sortedEmails(data) {
-  return Array.isArray(data.emails)
-    ? [...data.emails].sort((a, b) => Number(b.date || b.timestamp || 0) - Number(a.date || a.timestamp || 0))
+function sortedEmails(emails) {
+  return Array.isArray(emails)
+    ? [...emails].sort((a, b) => Number(b.date || b.timestamp || 0) - Number(a.date || a.timestamp || 0))
     : [];
+}
+
+function unwrapArray(payload) {
+  if (Array.isArray(payload)) return payload;
+  if (!payload || typeof payload !== "object") return [];
+  return payload.emails || payload.messages || payload.mail || payload.data || payload.result || [];
+}
+
+async function tempmailRequest(config, endpoint) {
+  const result = await fetchWithTimeout(`${RAPIDAPI_TEMPMAIL_BASE}${endpoint}`, {
+    headers: {
+      "X-RapidAPI-Host": RAPIDAPI_TEMPMAIL_HOST,
+      "X-RapidAPI-Key": config.tempmail_api_key
+    }
+  }, 15000);
+  if (!result.response.ok) {
+    throw new Error(`Temp Mail API returned ${result.response.status}: ${result.text.slice(0, 500)}`);
+  }
+  return result.json;
+}
+
+async function getTempmailDomain(config) {
+  if (config.tempmail_domain && config.tempmail_domain !== RAPIDAPI_TEMPMAIL_HOST) {
+    return config.tempmail_domain.replace(/^@/, "");
+  }
+  const payload = await tempmailRequest(config, "/request/domains/");
+  const domains = unwrapArray(payload).map((domain) => String(domain.domain || domain.name || domain).replace(/^@/, ""));
+  const domain = domains.find(Boolean);
+  if (!domain) throw new Error("Temp Mail API did not return any domains");
+  return domain;
+}
+
+async function fetchTempmailEmails(config, address) {
+  const crypto = require("crypto");
+  const md5 = crypto.createHash("md5").update(address.toLowerCase()).digest("hex");
+  const payload = await tempmailRequest(config, `/request/mail/id/${md5}/`);
+  return unwrapArray(payload).map((email, index) => ({
+    id: email.id || email.mail_id || email.messageId || `${email.date || email.timestamp || "tempmail"}-${index}`,
+    from: email.from || email.mail_from || email.sender || "",
+    to: email.to || email.mail_to || address,
+    subject: email.subject || email.mail_subject || "(no subject)",
+    date: email.date || email.mail_date || email.mail_timestamp || email.timestamp || null,
+    text: email.text || email.mail_text_only || email.mail_text || email.body || "",
+    html: email.html || email.mail_html || ""
+  }));
+}
+
+async function generateEmailAddress(config) {
+  if (getEmailProvider(config) === "tempmail") {
+    return `${Math.random().toString(36).slice(2, 12)}@${await getTempmailDomain(config)}`;
+  }
+  return `${config.testmail_namespace}.${Math.random().toString(36).slice(2, 12)}@inbox.testmail.app`;
+}
+
+async function fetchProviderEmails(config, target, limit = 10, offset = 0) {
+  if (getEmailProvider(config) === "tempmail") return fetchTempmailEmails(config, target);
+  const data = await fetchTestmailEmails(config, limit, offset);
+  return data.emails || [];
 }
 
 function stripCountryCode(phoneNumber, countryId) {
@@ -542,29 +645,57 @@ async function handleApi(req, res, parsedUrl) {
       return sendJson(res, 200, publicConfig(config));
     }
 
-    if (parsedUrl.pathname === "/api/testmail/emails" && req.method === "GET") {
+    if (parsedUrl.pathname === "/api/config" && req.method === "POST") {
+      const body = await readJsonBody(req);
+      const provider = String(body.default_email_provider || body.email_provider || "").trim().toLowerCase();
+      if (!["testmail", "tempmail"].includes(provider)) {
+        return sendJson(res, 400, { success: false, error: "Invalid email provider" });
+      }
+      const config = await updateConfig({ default_email_provider: provider });
+      return sendJson(res, 200, publicConfig(config));
+    }
+
+    if (parsedUrl.pathname === "/api/email/generate" && req.method === "GET") {
       const config = await loadConfig();
-      const missing = missingKeys(config, ["testmail_api_key", "testmail_namespace"]);
+      const missing = missingEmailConfig(config);
+      if (missing.length) {
+        return sendJson(res, 400, { success: false, error: `Missing config: ${missing.join(", ")}` });
+      }
+
+      return sendJson(res, 200, {
+        success: true,
+        email: await generateEmailAddress(config),
+        provider: getEmailProvider(config)
+      });
+    }
+
+    if ((parsedUrl.pathname === "/api/email/emails" || parsedUrl.pathname === "/api/testmail/emails") && req.method === "GET") {
+      const config = await loadConfig();
+      const missing = missingEmailConfig(config);
       if (missing.length) {
         return sendJson(res, 400, { success: false, error: `Missing config: ${missing.join(", ")}` });
       }
 
       const limit = Math.max(1, Math.min(Number(parsedUrl.searchParams.get("limit") || 10), 50));
       const offset = Math.max(0, Number(parsedUrl.searchParams.get("offset") || 0));
-      const data = await fetchTestmailEmails(config, limit, offset);
-      const emails = sortedEmails(data).slice(0, limit).map(normalizeEmail);
+      const target = String(parsedUrl.searchParams.get("email") || "").trim().toLowerCase();
+      if (getEmailProvider(config) === "tempmail" && !target) {
+        return sendJson(res, 400, { success: false, error: "Missing email" });
+      }
+      const rawEmails = await fetchProviderEmails(config, target, limit, offset);
+      const emails = sortedEmails(rawEmails).slice(0, limit).map(normalizeEmail);
 
       return sendJson(res, 200, {
         success: true,
         emails,
         count: emails.length,
-        result_count: data.result_count ?? data.count ?? null
+        result_count: rawEmails.length || null
       });
     }
 
-    if (parsedUrl.pathname === "/api/testmail/email" && req.method === "GET") {
+    if ((parsedUrl.pathname === "/api/email/email" || parsedUrl.pathname === "/api/testmail/email") && req.method === "GET") {
       const config = await loadConfig();
-      const missing = missingKeys(config, ["testmail_api_key", "testmail_namespace"]);
+      const missing = missingEmailConfig(config);
       if (missing.length) {
         return sendJson(res, 400, { success: false, error: `Missing config: ${missing.join(", ")}` });
       }
@@ -572,8 +703,11 @@ async function handleApi(req, res, parsedUrl) {
       const id = String(parsedUrl.searchParams.get("id") || "").trim();
       if (!id) return sendJson(res, 400, { success: false, error: "Missing email id" });
 
-      const data = await fetchTestmailEmails(config, 25, 0);
-      const emails = sortedEmails(data);
+      const target = String(parsedUrl.searchParams.get("email") || "").trim().toLowerCase();
+      if (getEmailProvider(config) === "tempmail" && !target) {
+        return sendJson(res, 400, { success: false, error: "Missing email" });
+      }
+      const emails = sortedEmails(await fetchProviderEmails(config, target, 25, 0));
       const match = emails.find((email, index) => normalizeEmail(email, index).id === id);
 
       if (!match) return sendJson(res, 404, { success: false, error: "Email not found" });
@@ -584,9 +718,9 @@ async function handleApi(req, res, parsedUrl) {
       });
     }
 
-    if (parsedUrl.pathname === "/api/testmail/magic-link" && req.method === "GET") {
+    if ((parsedUrl.pathname === "/api/email/magic-link" || parsedUrl.pathname === "/api/testmail/magic-link") && req.method === "GET") {
       const config = await loadConfig();
-      const missing = missingKeys(config, ["testmail_api_key", "testmail_namespace"]);
+      const missing = missingEmailConfig(config);
       if (missing.length) {
         return sendJson(res, 400, { success: false, error: `Missing config: ${missing.join(", ")}` });
       }
@@ -594,8 +728,7 @@ async function handleApi(req, res, parsedUrl) {
       const target = String(parsedUrl.searchParams.get("email") || "").trim().toLowerCase();
       if (!target) return sendJson(res, 400, { success: false, error: "Missing email" });
 
-      const data = await fetchTestmailEmails(config, 20, 0);
-      const emails = sortedEmails(data);
+      const emails = sortedEmails(await fetchProviderEmails(config, target, 20, 0));
       const matching = emails.filter((email) => recipientMatches(email, target));
 
       for (const email of matching) {
@@ -638,7 +771,7 @@ async function handleApi(req, res, parsedUrl) {
 
     if (parsedUrl.pathname === "/api/accounts/magic-link" && req.method === "POST") {
       const config = await loadConfig();
-      const missing = missingKeys(config, ["testmail_api_key", "testmail_namespace"]);
+      const missing = missingEmailConfig(config);
       if (missing.length) {
         return sendJson(res, 400, { success: false, error: `Missing config: ${missing.join(", ")}` });
       }
@@ -647,8 +780,7 @@ async function handleApi(req, res, parsedUrl) {
       const target = String(body.email || "").trim().toLowerCase();
       if (!target) return sendJson(res, 400, { success: false, error: "Missing email" });
 
-      const data = await fetchTestmailEmails(config, 30, 0);
-      const emails = sortedEmails(data);
+      const emails = sortedEmails(await fetchProviderEmails(config, target, 30, 0));
       const matching = emails.filter((email) => recipientMatches(email, target));
 
       for (const email of matching) {

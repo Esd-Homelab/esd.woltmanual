@@ -90,13 +90,53 @@ function generateIdentity() {
   saveBindings();
 }
 
-function generateEmail() {
-  const namespace = state.config?.testmail_namespace || "";
-  state.email = namespace ? `${namespace}.${randomToken()}@inbox.testmail.app` : "";
+async function generateEmail() {
+  const provider = state.config?.email_provider || "testmail";
+  if (provider === "tempmail") {
+    const data = await api("/api/email/generate");
+    state.email = data.email || "";
+  } else {
+    const namespace = state.config?.testmail_namespace || "";
+    state.email = namespace ? `${namespace}.${randomToken()}@inbox.testmail.app` : "";
+  }
   state.magicLink = "";
   state.magicStatus = "waiting";
   state.selectedEmail = null;
   state.selectedEmailId = "";
+}
+
+function canGenerateEmail() {
+  if (!state.config) return false;
+  return state.config.email_provider === "tempmail"
+    ? state.config.has_tempmail_api_key
+    : Boolean(state.config.testmail_namespace);
+}
+
+function emailProviderLabel() {
+  return state.config?.email_provider === "tempmail" ? "tempmail" : "testmail";
+}
+
+function emailPatternLabel() {
+  if (state.config?.email_provider === "tempmail") {
+    return `random@${state.config?.tempmail_domain || "tempmail domain"}`;
+  }
+  return `namespace.${state.config?.testmail_namespace ? "random" : "missing"}@inbox.testmail.app`;
+}
+
+async function setDefaultEmailProvider(provider) {
+  if (!provider || provider === state.config?.default_email_provider) return;
+  state.error = "";
+  try {
+    state.config = await api("/api/config", {
+      method: "POST",
+      body: JSON.stringify({ default_email_provider: provider })
+    });
+    await generateEmail();
+    showToast(`Default set to ${emailProviderLabel()}`);
+  } catch (error) {
+    state.error = error.message;
+    render();
+  }
 }
 
 async function api(path, options = {}) {
@@ -177,18 +217,21 @@ function restart() {
   state.smsCode = "";
   state.smsStatus = "";
   generateIdentity();
-  generateEmail();
+  generateEmail().catch((error) => {
+    state.error = error.message;
+    render();
+  });
   render();
 }
 
 async function loadConfig() {
   try {
     state.config = await api("/api/config");
-    if (!state.config.testmail_namespace) {
-      state.error = "Missing config: testmail_namespace";
+    if (state.config.missing?.length) {
+      state.error = `Missing config: ${state.config.missing.join(", ")}`;
     }
     generateIdentity();
-    generateEmail();
+    await generateEmail();
   } catch (error) {
     state.error = error.message;
   }
@@ -244,7 +287,7 @@ async function refreshInbox() {
   render();
 
   try {
-    const data = await api("/api/testmail/emails?limit=10&offset=0");
+    const data = await api(`/api/email/emails?limit=10&offset=0&email=${encodeURIComponent(state.email)}`);
     state.emails = data.emails || [];
   } catch (error) {
     state.error = error.message;
@@ -261,7 +304,7 @@ async function loadEmailDetail(id) {
   render();
 
   try {
-    const data = await api(`/api/testmail/email?id=${encodeURIComponent(id)}`);
+    const data = await api(`/api/email/email?id=${encodeURIComponent(id)}&email=${encodeURIComponent(state.email)}`);
     state.selectedEmail = data.email;
   } catch (error) {
     state.error = error.message;
@@ -277,7 +320,7 @@ async function refreshMagicLink() {
   render();
 
   try {
-    const data = await api(`/api/testmail/magic-link?email=${encodeURIComponent(state.email)}`);
+    const data = await api(`/api/email/magic-link?email=${encodeURIComponent(state.email)}`);
     state.magicStatus = data.status || "waiting";
     if (data.magic_link) {
       state.magicLink = data.magic_link;
@@ -527,7 +570,7 @@ function layout(content) {
       <header class="topbar">
         <div class="brand">
           <strong>esd.woltmanual</strong>
-          <span>${escapeHtml(state.config?.testmail_namespace || "no namespace")}</span>
+          <span>${escapeHtml(`${emailProviderLabel()}: ${state.config?.email_label || "not configured"}`)}</span>
         </div>
         <div class="top-actions">
           <button class="secondary" data-action="open-wolt">Open Wolt</button>
@@ -555,23 +598,31 @@ function layout(content) {
 }
 
 function renderEmailStep() {
+  const provider = state.config?.default_email_provider || state.config?.email_provider || "testmail";
   return layout(`
     <section class="panel">
       <div class="panel-header">
         <div class="panel-title">Email</div>
-        <div class="status-line">namespace.${state.config?.testmail_namespace ? "random" : "missing"}@inbox.testmail.app</div>
+        <div class="status-line">${escapeHtml(emailPatternLabel())}</div>
       </div>
       <div class="panel-body stack">
         <div class="field">
+          <div class="label">Default email provider</div>
+          <div class="provider-switch" role="group" aria-label="Email provider">
+            <button class="${provider === "testmail" ? "active" : "secondary"}" data-action="set-default-provider" data-provider="testmail">Testmail${provider === "testmail" ? " default" : ""}</button>
+            <button class="${provider === "tempmail" ? "active" : "secondary"}" data-action="set-default-provider" data-provider="tempmail">Temp Mail${provider === "tempmail" ? " default" : ""}</button>
+          </div>
+        </div>
+        <div class="field">
           <div class="label">Generated email</div>
           <div class="copy-row">
-            <div class="value-box large">${escapeHtml(state.email || "Missing testmail_namespace")}</div>
+            <div class="value-box large">${escapeHtml(state.email || `Missing ${emailProviderLabel()} config`)}</div>
             <button data-action="copy-email" ${state.email ? "" : "disabled"}>Copy</button>
           </div>
         </div>
         <div class="actions">
           <div class="actions-left">
-            <button class="secondary" data-action="new-email" ${state.config?.testmail_namespace ? "" : "disabled"}>New email</button>
+            <button class="secondary" data-action="new-email" ${canGenerateEmail() ? "" : "disabled"}>New email</button>
           </div>
         </div>
       </div>
@@ -960,10 +1011,15 @@ function bindActions() {
       stopAccountMagicPolling();
       render();
     });
-    if (action === "new-email") element.addEventListener("click", () => {
-      generateEmail();
+    if (action === "new-email") element.addEventListener("click", async () => {
+      try {
+        await generateEmail();
+      } catch (error) {
+        state.error = error.message;
+      }
       render();
     });
+    if (action === "set-default-provider") element.addEventListener("click", () => setDefaultEmailProvider(element.dataset.provider));
     if (action === "new-name") element.addEventListener("click", () => {
       generateIdentity();
       render();
