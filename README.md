@@ -24,6 +24,16 @@ Example:
 
 Set `default_email_provider` to either `testmail` or `tempmail`. `email_provider` is kept for compatibility and should usually match `default_email_provider`. `tempmail_domain` is optional; when empty the app asks the Temp Mail API for an available domain.
 
+| Key | Description |
+| --- | --- |
+| `sms_api_key` | Hero SMS API key used for phone number and SMS code requests. |
+| `default_email_provider` | Startup email provider. Use `testmail` or `tempmail`. |
+| `email_provider` | Compatibility value; keep it matching `default_email_provider`. |
+| `testmail_api_key` | Testmail API key used for reading inbox messages. |
+| `testmail_namespace` | Testmail namespace used to generate inbox addresses. |
+| `tempmail_api_key` | RapidAPI key for Temp Mail. |
+| `tempmail_domain` | Optional Temp Mail domain. Leave empty to auto-select one. |
+
 Generated accounts are stored in `accounts.json`.
 
 The Wolt button launches a private Firefox or Chromium window when either browser is installed.
