@@ -1,0 +1,31 @@
+{
+  "$schema": "../node_modules/@tauri-apps/cli/config.schema.json",
+  "productName": "Woltmanual",
+  "version": "1.0.0",
+  "identifier": "com.esd.woltmanual",
+  "build": {
+    "frontendDist": "../public"
+  },
+  "app": {
+    "withGlobalTauri": true,
+    "windows": [
+      {
+        "title": "Woltmanual",
+        "width": 1180,
+        "height": 900,
+        "minWidth": 320,
+        "minHeight": 600,
+        "theme": "Dark",
+        "backgroundColor": "#050505"
+      }
+    ],
+    "security": {
+      "csp": null
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": ["deb"],
+    "icon": ["icons/icon.png"]
+  }
+}

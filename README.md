@@ -1,9 +1,23 @@
-# esd.woltmanual
+# Woltmanual
 
 Local manual Wolt helper.
 
+Run the desktop app in development:
+
 ```bash
 npm start
+```
+
+Run the legacy web server:
+
+```bash
+npm run web
+```
+
+Build the desktop app:
+
+```bash
+npm run build
 ```
 
 The app reads `config.json` from the project root. Use `default_email_provider` to choose which email provider is selected when the app starts. The visual provider switch in the Email step updates this value and saves it back to `config.json`.

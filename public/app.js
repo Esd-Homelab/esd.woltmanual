@@ -139,7 +139,24 @@ async function setDefaultEmailProvider(provider) {
   }
 }
 
+function tauriInvoke() {
+  return window.__TAURI__?.core?.invoke;
+}
+
 async function api(path, options = {}) {
+  const invoke = tauriInvoke();
+  if (invoke) {
+    const data = await invoke("api_request", {
+      path,
+      method: options.method || "GET",
+      body: options.body || ""
+    });
+    if (data.success === false) {
+      throw new Error(data.error || "Request failed");
+    }
+    return data;
+  }
+
   const response = await fetch(path, {
     ...options,
     headers: {
@@ -489,7 +506,11 @@ async function deleteAccount(email) {
 
 function loadBindings() {
   try {
-    const saved = JSON.parse(localStorage.getItem("esd.woltmanual.bindings") || "[]");
+    const saved = JSON.parse(
+      localStorage.getItem("woltmanual.bindings")
+      || localStorage.getItem("esd.woltmanual.bindings")
+      || "[]"
+    );
     if (!Array.isArray(saved) || !saved.length) return DEFAULT_BINDINGS;
     return DEFAULT_BINDINGS.map((binding) => ({
       ...binding,
@@ -501,7 +522,7 @@ function loadBindings() {
 }
 
 function saveBindings() {
-  localStorage.setItem("esd.woltmanual.bindings", JSON.stringify(state.bindings));
+  localStorage.setItem("woltmanual.bindings", JSON.stringify(state.bindings));
 }
 
 function updateBindingValue(id, value, shouldRender = true) {
@@ -569,7 +590,7 @@ function layout(content) {
     <main class="shell">
       <header class="topbar">
         <div class="brand">
-          <strong>esd.woltmanual</strong>
+          <strong>Woltmanual</strong>
           <span>${escapeHtml(`${emailProviderLabel()}: ${state.config?.email_label || "not configured"}`)}</span>
         </div>
         <div class="top-actions">
