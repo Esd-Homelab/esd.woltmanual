@@ -11,6 +11,7 @@ use std::{
 };
 use tauri::{AppHandle, Manager};
 use url::Url;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 type ApiResult<T> = Result<T, String>;
 
@@ -21,6 +22,7 @@ const RAPIDAPI_TEMPMAIL_HOST: &str = "privatix-temp-mail-v1.p.rapidapi.com";
 const RAPIDAPI_TEMPMAIL_BASE: &str = "https://privatix-temp-mail-v1.p.rapidapi.com";
 const WOLT_SERVICE: &str = "rr";
 const WOLT_URL: &str = "https://wolt.com";
+const DEFAULT_VPN_COUNTRY: &str = "Denmark";
 
 #[derive(Clone, Debug)]
 struct Config {
@@ -56,6 +58,21 @@ struct PriceData {
 struct Browser {
     command: String,
     kind: String,
+}
+
+#[derive(Debug)]
+struct Fingerprint {
+    user_agent: String,
+    profile_dir: String,
+    width: u32,
+    height: u32,
+    pos_x: i32,
+    pos_y: i32,
+    lang: String,
+    gl_renderer: String,
+    webrtc_policy: String,
+    canvas_blocked: bool,
+    features_disabled: Vec<String>,
 }
 
 #[tauri::command]
@@ -318,11 +335,24 @@ async fn handle_api(
 
     if pathname == "/api/browser/open" && method == "POST" {
         let preferred = body_string(&body, "browser").unwrap_or_default();
-        let browser = launch_private_browser(&preferred)?;
+        let (browser, fp) = launch_private_browser(&preferred)?;
         return Ok(json!({
             "success": true,
             "browser": browser.command,
-            "private_mode": if browser.kind == "firefox" { "private-window" } else { "incognito" }
+            "private_mode": if browser.kind == "firefox" { "private-window" } else { "incognito" },
+            "fingerprint": {
+                "user_agent": fp.user_agent,
+                "profile_dir": fp.profile_dir,
+                "width": fp.width,
+                "height": fp.height,
+                "pos_x": fp.pos_x,
+                "pos_y": fp.pos_y,
+                "lang": fp.lang,
+                "gl_renderer": fp.gl_renderer,
+                "webrtc_policy": fp.webrtc_policy,
+                "canvas_blocked": fp.canvas_blocked,
+                "features_disabled": fp.features_disabled
+            }
         }));
     }
 
@@ -342,7 +372,7 @@ async fn handle_api(
             )));
         }
 
-        let country = query_param_default(&parsed_url, "country", "15");
+        let country = query_param_default(&parsed_url, "country", "172");
         let balance_result = hero_request(
             &[
                 ("api_key", config.sms_api_key.as_str()),
@@ -402,7 +432,7 @@ async fn handle_api(
             )));
         }
 
-        let country = body_string(&body, "country").unwrap_or_else(|| "15".to_string());
+        let country = body_string(&body, "country").unwrap_or_else(|| "172".to_string());
         let max_price = body_string(&body, "max_price").unwrap_or_default();
         let mut params = vec![
             ("api_key", config.sms_api_key.as_str()),
@@ -512,6 +542,77 @@ async fn handle_api(
             }
         };
         return Ok(json!({ "success": false, "status": "error", "error": error }));
+    }
+
+    if pathname == "/api/vpn/status" && method == "GET" {
+        return match vpn_status_value() {
+            Ok(value) => Ok(value),
+            Err(error) => Ok(error_json(error)),
+        };
+    }
+
+    if pathname == "/api/vpn/countries" && method == "GET" {
+        let (ok, text) = nordvpn_run(&["countries"])?;
+        if !ok {
+            return Ok(error_json(if text.is_empty() {
+                "Failed to list VPN countries".to_string()
+            } else {
+                text
+            }));
+        }
+
+        let countries = text
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .map(|line| json!({ "id": line, "name": line.replace('_', " ") }))
+            .collect::<Vec<_>>();
+
+        return Ok(json!({ "success": true, "countries": countries }));
+    }
+
+    if pathname == "/api/vpn/connect" && method == "POST" {
+        let country = body_string(&body, "country")
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+        let country = if country.is_empty() {
+            DEFAULT_VPN_COUNTRY.to_string()
+        } else {
+            country
+        };
+
+        let (ok, message) = nordvpn_run(&["connect", &country])?;
+        if !ok {
+            return Ok(error_json(if message.is_empty() {
+                "Failed to connect".to_string()
+            } else {
+                message
+            }));
+        }
+
+        let mut status = vpn_status_value()?;
+        if let Value::Object(ref mut map) = status {
+            map.insert("message".to_string(), json!(message));
+        }
+        return Ok(status);
+    }
+
+    if pathname == "/api/vpn/disconnect" && method == "POST" {
+        let (ok, message) = nordvpn_run(&["disconnect"])?;
+        if !ok {
+            return Ok(error_json(if message.is_empty() {
+                "Failed to disconnect".to_string()
+            } else {
+                message
+            }));
+        }
+
+        let mut status = vpn_status_value()?;
+        if let Value::Object(ref mut map) = status {
+            map.insert("message".to_string(), json!(message));
+        }
+        return Ok(status);
     }
 
     Ok(error_json("Not found"))
@@ -1537,6 +1638,64 @@ fn delete_account(app: &AppHandle, email: &str) -> ApiResult<bool> {
     Ok(deleted)
 }
 
+fn nordvpn_run(args: &[&str]) -> ApiResult<(bool, String)> {
+    let output = Command::new("nordvpn").args(args).output().map_err(|error| {
+        if error.kind() == io::ErrorKind::NotFound {
+            "NordVPN CLI not found. Install NordVPN to use VPN controls.".to_string()
+        } else {
+            format!("Failed to run nordvpn: {error}")
+        }
+    })?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    let message = if !stdout.is_empty() { stdout } else { stderr };
+    Ok((output.status.success(), message))
+}
+
+fn parse_vpn_status(text: &str) -> Value {
+    let mut map = Map::new();
+    let mut connected = false;
+
+    for line in text.lines() {
+        let Some((key, value)) = line.split_once(':') else {
+            continue;
+        };
+        let key = key.trim();
+        let value = value.trim();
+        if key.is_empty() {
+            continue;
+        }
+
+        if key.eq_ignore_ascii_case("status") {
+            connected = value.eq_ignore_ascii_case("connected");
+        }
+
+        let normalized_key = key.to_lowercase().replace(' ', "_");
+        map.insert(normalized_key, json!(value));
+    }
+
+    map.insert("connected".to_string(), json!(connected));
+    Value::Object(map)
+}
+
+fn vpn_status_value() -> ApiResult<Value> {
+    let (ok, text) = nordvpn_run(&["status"])?;
+    if !ok {
+        return Err(if text.is_empty() {
+            "Failed to read VPN status".to_string()
+        } else {
+            text
+        });
+    }
+
+    let mut status = parse_vpn_status(&text);
+    if let Value::Object(ref mut map) = status {
+        map.insert("success".to_string(), json!(true));
+    }
+    Ok(status)
+}
+
 fn find_browser(preferred: &str) -> Option<Browser> {
     let chromium = [
         "chromium",
@@ -1579,20 +1738,147 @@ fn find_browser(preferred: &str) -> Option<Browser> {
     None
 }
 
-fn launch_private_browser(preferred: &str) -> ApiResult<Browser> {
+fn random_user_agent() -> String {
+    let platforms = [
+        "Windows NT 10.0; Win64; x64",
+        "Windows NT 10.0; WOW64",
+        "Windows NT 11.0; Win64; x64",
+    ];
+    let versions = ["133", "134", "135", "136", "137"];
+    let platform = platforms[rand::thread_rng().gen_range(0..platforms.len())];
+    let version = versions[rand::thread_rng().gen_range(0..versions.len())];
+    format!("Mozilla/5.0 ({platform}) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/{version}.0.0.0 Safari/537.36")
+}
+
+fn random_viewport() -> (u32, u32) {
+    let dimensions = [(1280, 720), (1366, 768), (1440, 900), (1536, 864), (1920, 1080)];
+    dimensions[rand::thread_rng().gen_range(0..dimensions.len())]
+}
+
+fn random_position() -> (i32, i32) {
+    let rng = &mut rand::thread_rng();
+    (rng.gen_range(20..200), rng.gen_range(20..200))
+}
+
+fn setup_fingerprint_profile_dir() -> String {
+    let timestamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis();
+    format!("/tmp/wolt-profile-{timestamp}-{}", rand::thread_rng().gen_range(1000u32..9999u32))
+}
+
+fn launch_private_browser(preferred: &str) -> ApiResult<(Browser, Fingerprint)> {
     let browser = find_browser(preferred)
         .ok_or_else(|| "No supported browser found. Install Firefox or Chromium.".to_string())?;
-    let args = if browser.kind == "firefox" {
-        vec!["--private-window", WOLT_URL]
-    } else {
-        vec![
-            "--incognito",
-            "--new-window",
-            "--window-size=980,980",
-            "--window-position=20,20",
-            WOLT_URL,
-        ]
-    };
+
+    if browser.kind == "firefox" {
+        let profile_dir = setup_fingerprint_profile_dir();
+        fs::create_dir_all(&profile_dir).map_err(|error| format!("Failed to create profile dir: {error}"))?;
+
+        let mut prefs_js = String::new();
+        prefs_js.push_str("user_pref(\"privacy.fingerprintingProtection\", true);\n");
+        prefs_js.push_str("user_pref(\"privacy.resistFingerprinting\", true);\n");
+        prefs_js.push_str("user_pref(\"privacy.trackingprotection.fingerprinting.enabled\", true);\n");
+        prefs_js.push_str("user_pref(\"media.peerconnection.enabled\", false);\n");
+        prefs_js.push_str("user_pref(\"media.navigator.enabled\", false);\n");
+        prefs_js.push_str("user_pref(\"dom.webnotifications.enabled\", false);\n");
+        prefs_js.push_str("user_pref(\"geo.enabled\", false);\n");
+        prefs_js.push_str("user_pref(\"browser.shell.checkDefaultBrowser\", false);\n");
+        prefs_js.push_str("user_pref(\"datareporting.healthreport.uploadEnabled\", false);\n");
+        prefs_js.push_str("user_pref(\"toolkit.telemetry.reportingpolicy.firstRun\", false);\n");
+        prefs_js.push_str("user_pref(\"browser.newtabpage.activity-stream.feeds.telemetry\", false);\n");
+        prefs_js.push_str("user_pref(\"browser.newtabpage.activity-stream.telemetry\", false);\n");
+        prefs_js.push_str("user_pref(\"devtools.onboarding.telemetry.logged\", false);\n");
+        prefs_js.push_str("user_pref(\"app.normandy.enabled\", false);\n");
+        prefs_js.push_str("user_pref(\"app.shield.optoutstudies.enabled\", false);\n");
+        prefs_js.push_str("user_pref(\"canvas.capturestream.enabled\", false);\n");
+        prefs_js.push_str("user_pref(\"webgl.disabled\", true);\n");
+        prefs_js.push_str("user_pref(\"dom.battery.enabled\", false);\n");
+        prefs_js.push_str("user_pref(\"network.http.referer.XOriginPolicy\", 1);\n");
+
+        fs::write(format!("{profile_dir}/user.js"), prefs_js)
+            .map_err(|error| format!("Failed to write Firefox prefs: {error}"))?;
+
+        let (width, height) = random_viewport();
+        let (pos_x, pos_y) = random_position();
+
+        Command::new(&browser.command)
+            .args([
+                "--profile", &profile_dir,
+                "--new-window", WOLT_URL,
+                "--window-size", &format!("{width},{height}"),
+                "--window-position", &format!("{pos_x},{pos_y}"),
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .map_err(|error| format!("Failed to launch Firefox: {error}"))?;
+
+        let fp = Fingerprint {
+            user_agent: String::new(),
+            profile_dir,
+            width,
+            height,
+            pos_x,
+            pos_y,
+            lang: "en-US".to_string(),
+            gl_renderer: "WebGL disabled".to_string(),
+            webrtc_policy: "disabled".to_string(),
+            canvas_blocked: true,
+            features_disabled: vec![
+                "fingerprintingProtection".to_string(),
+                "resistFingerprinting".to_string(),
+                "peerconnection".to_string(),
+                "webgl".to_string(),
+                "canvas.capturestream".to_string(),
+                "battery".to_string(),
+            ],
+        };
+        return Ok((browser, fp));
+    }
+
+    let profile_dir = setup_fingerprint_profile_dir();
+    fs::create_dir_all(&profile_dir).map_err(|error| format!("Failed to create profile dir: {error}"))?;
+
+    let user_agent = random_user_agent();
+    let (width, height) = random_viewport();
+    let (pos_x, pos_y) = random_position();
+    let lang = "en-US";
+
+    let features_disabled = vec![
+        "sync".to_string(),
+        "background-networking".to_string(),
+        "breakpad".to_string(),
+        "client-side-phishing-detection".to_string(),
+        "component-update".to_string(),
+        "default-apps".to_string(),
+        "hang-monitor".to_string(),
+        "popup-blocking".to_string(),
+        "renderer-backgrounding".to_string(),
+    ];
+
+    let args = vec![
+        format!("--user-data-dir={profile_dir}"),
+        "--no-first-run".to_string(),
+        "--no-default-browser-check".to_string(),
+        "--disable-sync".to_string(),
+        "--disable-background-networking".to_string(),
+        "--disable-background-timer-throttling".to_string(),
+        "--disable-backgrounding-occluded-windows".to_string(),
+        "--disable-breakpad".to_string(),
+        "--disable-client-side-phishing-detection".to_string(),
+        "--disable-component-update".to_string(),
+        "--disable-default-apps".to_string(),
+        "--disable-hang-monitor".to_string(),
+        "--disable-popup-blocking".to_string(),
+        "--disable-prompt-on-repost".to_string(),
+        "--disable-renderer-backgrounding".to_string(),
+        "--disable-session-crashed-bubble".to_string(),
+        format!("--user-agent={user_agent}"),
+        format!("--lang={lang}"),
+        format!("--window-size={width},{height}"),
+        format!("--window-position={pos_x},{pos_y}"),
+        WOLT_URL.to_string(),
+    ];
 
     Command::new(&browser.command)
         .args(args)
@@ -1600,7 +1886,21 @@ fn launch_private_browser(preferred: &str) -> ApiResult<Browser> {
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
-        .map_err(|error| error.to_string())?;
+        .map_err(|error| format!("Failed to launch Chromium: {error}"))?;
 
-    Ok(browser)
+    let fp = Fingerprint {
+        user_agent,
+        profile_dir,
+        width,
+        height,
+        pos_x,
+        pos_y,
+        lang: lang.to_string(),
+        gl_renderer: "default".to_string(),
+        webrtc_policy: "default".to_string(),
+        canvas_blocked: false,
+        features_disabled,
+    };
+
+    Ok((browser, fp))
 }

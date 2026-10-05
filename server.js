@@ -596,6 +596,31 @@ function normalizeCountries(payload) {
   return countries.length ? countries : FALLBACK_COUNTRIES;
 }
 
+function randomUserAgent() {
+  const platforms = [
+    "Windows NT 10.0; Win64; x64",
+    "Windows NT 10.0; WOW64",
+    "Windows NT 11.0; Win64; x64"
+  ];
+  const versions = ["133", "134", "135", "136", "137"];
+  const platform = platforms[Math.floor(Math.random() * platforms.length)];
+  const version = versions[Math.floor(Math.random() * versions.length)];
+  return `Mozilla/5.0 (${platform}) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/${version}.0.0.0 Safari/537.36`;
+}
+
+function randomViewport() {
+  const dims = [[1280, 720], [1366, 768], [1440, 900], [1536, 864], [1920, 1080]];
+  return dims[Math.floor(Math.random() * dims.length)];
+}
+
+function randomPosition() {
+  return [Math.floor(Math.random() * 180) + 20, Math.floor(Math.random() * 180) + 20];
+}
+
+function fingerprintProfileDir() {
+  return `/tmp/wolt-profile-${Date.now()}-${Math.floor(Math.random() * 9000) + 1000}`;
+}
+
 function findBrowser(preferred) {
   const groups = {
     chromium: ["chromium", "chromium-browser", "google-chrome", "google-chrome-stable", "brave-browser", "microsoft-edge"],
@@ -625,9 +650,114 @@ function launchPrivateBrowser(preferred) {
     throw new Error("No supported browser found. Install Firefox or Chromium.");
   }
 
-  const args = browser.kind === "firefox"
-    ? ["--private-window", WOLT_URL]
-    : ["--incognito", "--new-window", "--window-size=980,980", "--window-position=20,20", WOLT_URL];
+  if (browser.kind === "firefox") {
+    const profileDir = fingerprintProfileDir();
+    fs.mkdirSync(profileDir, { recursive: true });
+
+    const prefs = [
+      `user_pref("privacy.fingerprintingProtection", true);`,
+      `user_pref("privacy.resistFingerprinting", true);`,
+      `user_pref("privacy.trackingprotection.fingerprinting.enabled", true);`,
+      `user_pref("media.peerconnection.enabled", false);`,
+      `user_pref("media.navigator.enabled", false);`,
+      `user_pref("dom.webnotifications.enabled", false);`,
+      `user_pref("geo.enabled", false);`,
+      `user_pref("browser.shell.checkDefaultBrowser", false);`,
+      `user_pref("datareporting.healthreport.uploadEnabled", false);`,
+      `user_pref("toolkit.telemetry.reportingpolicy.firstRun", false);`,
+      `user_pref("browser.newtabpage.activity-stream.feeds.telemetry", false);`,
+      `user_pref("browser.newtabpage.activity-stream.telemetry", false);`,
+      `user_pref("devtools.onboarding.telemetry.logged", false);`,
+      `user_pref("app.normandy.enabled", false);`,
+      `user_pref("app.shield.optoutstudies.enabled", false);`,
+      `user_pref("canvas.capturestream.enabled", false);`,
+      `user_pref("webgl.disabled", true);`,
+      `user_pref("dom.battery.enabled", false);`,
+      `user_pref("network.http.referer.XOriginPolicy", 1);`
+    ];
+
+    fs.writeFileSync(`${profileDir}/user.js`, prefs.join("\n") + "\n");
+
+    const [width, height] = randomViewport();
+    const [posX, posY] = randomPosition();
+
+    const child = spawn(browser.command, [
+      "--profile", profileDir,
+      "--new-window", WOLT_URL,
+      "--window-size", `${width},${height}`,
+      "--window-position", `${posX},${posY}`
+    ], {
+      detached: true,
+      stdio: "ignore"
+    });
+    child.unref();
+    return {
+      browser,
+      fingerprint: {
+        user_agent: "",
+        profile_dir: profileDir,
+        width,
+        height,
+        pos_x: posX,
+        pos_y: posY,
+        lang: "en-US",
+        gl_renderer: "WebGL disabled",
+        webrtc_policy: "disabled",
+        canvas_blocked: true,
+        features_disabled: [
+          "fingerprintingProtection",
+          "resistFingerprinting",
+          "peerconnection",
+          "webgl",
+          "canvas.capturestream",
+          "battery"
+        ]
+      }
+    };
+  }
+
+  const profileDir = fingerprintProfileDir();
+  fs.mkdirSync(profileDir, { recursive: true });
+
+  const userAgent = randomUserAgent();
+  const [width, height] = randomViewport();
+  const [posX, posY] = randomPosition();
+
+  const featuresDisabled = [
+    "sync",
+    "background-networking",
+    "breakpad",
+    "client-side-phishing-detection",
+    "component-update",
+    "default-apps",
+    "hang-monitor",
+    "popup-blocking",
+    "renderer-backgrounding"
+  ];
+
+  const args = [
+    `--user-data-dir=${profileDir}`,
+    "--no-first-run",
+    "--no-default-browser-check",
+    "--disable-sync",
+    "--disable-background-networking",
+    "--disable-background-timer-throttling",
+    "--disable-backgrounding-occluded-windows",
+    "--disable-breakpad",
+    "--disable-client-side-phishing-detection",
+    "--disable-component-update",
+    "--disable-default-apps",
+    "--disable-hang-monitor",
+    "--disable-popup-blocking",
+    "--disable-prompt-on-repost",
+    "--disable-renderer-backgrounding",
+    "--disable-session-crashed-bubble",
+    `--user-agent=${userAgent}`,
+    "--lang=en-US",
+    "--window-size", `${width},${height}`,
+    "--window-position", `${posX},${posY}`,
+    WOLT_URL
+  ];
 
   const child = spawn(browser.command, args, {
     detached: true,
@@ -635,7 +765,22 @@ function launchPrivateBrowser(preferred) {
   });
   child.unref();
 
-  return browser;
+  return {
+    browser,
+    fingerprint: {
+      user_agent: userAgent,
+      profile_dir: profileDir,
+      width,
+      height,
+      pos_x: posX,
+      pos_y: posY,
+      lang: "en-US",
+      gl_renderer: "default",
+      webrtc_policy: "default",
+      canvas_blocked: false,
+      features_disabled: featuresDisabled
+    }
+  };
 }
 
 async function handleApi(req, res, parsedUrl) {
@@ -807,11 +952,12 @@ async function handleApi(req, res, parsedUrl) {
 
     if (parsedUrl.pathname === "/api/browser/open" && req.method === "POST") {
       const body = await readJsonBody(req);
-      const browser = launchPrivateBrowser(body.browser);
+      const result = launchPrivateBrowser(body.browser);
       return sendJson(res, 200, {
         success: true,
-        browser: browser.command,
-        private_mode: browser.kind === "firefox" ? "private-window" : "incognito"
+        browser: result.browser.command,
+        private_mode: result.browser.kind === "firefox" ? "private-window" : "incognito",
+        fingerprint: result.fingerprint
       });
     }
 
@@ -828,7 +974,7 @@ async function handleApi(req, res, parsedUrl) {
         return sendJson(res, 400, { success: false, error: `Missing config: ${missing.join(", ")}` });
       }
 
-      const country = String(parsedUrl.searchParams.get("country") || "15");
+      const country = String(parsedUrl.searchParams.get("country") || "172");
       const [balanceResult, priceResult] = await Promise.all([
         heroRequest({ api_key: config.sms_api_key, action: "getBalance" }, 15000),
         heroRequest({
@@ -868,7 +1014,7 @@ async function handleApi(req, res, parsedUrl) {
       }
 
       const body = await readJsonBody(req);
-      const country = String(body.country || "15");
+      const country = String(body.country || "172");
       const maxPrice = body.max_price ? String(body.max_price) : "";
       const params = {
         api_key: config.sms_api_key,

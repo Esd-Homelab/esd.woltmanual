@@ -3,11 +3,7 @@ const app = document.getElementById("app");
 const FIRST_NAMES = ["Mads", "Frederik", "Emil", "Magnus", "Anders", "Sofie", "Ida", "Anna", "Laura", "Katrine"];
 const LAST_NAMES = ["Jensen", "Nielsen", "Hansen", "Pedersen", "Andersen", "Christensen", "Larsen", "Moller", "Olsen", "Thomsen"];
 
-const DEFAULT_BINDINGS = [
-  { id: "address", label: "Address", combo: "Alt+1", value: "" },
-  { id: "first_name", label: "First name", combo: "Alt+2", value: "" },
-  { id: "last_name", label: "Last name", combo: "Alt+3", value: "" }
-];
+const DEFAULT_VPN_COUNTRY = "Denmark";
 
 const state = {
   step: 1,
@@ -26,7 +22,7 @@ const state = {
   emailDetailLoading: false,
   magicLoading: false,
   countries: [],
-  country: "15",
+  country: "172",
   smsSummary: null,
   smsError: "",
   smsLoading: false,
@@ -40,17 +36,32 @@ const state = {
   accountMagicExpandedEmail: "",
   accountDeleteConfirmEmail: "",
   toolPanel: "",
-  bindings: loadBindings(),
   browserStatus: "",
-  toast: ""
+  fingerprint: null,
+  toast: "",
+  vpn: {
+    loaded: false,
+    available: true,
+    loading: false,
+    connected: false,
+    status: "",
+    country: "",
+    city: "",
+    server: "",
+    hostname: "",
+    ip: "",
+    error: "",
+    countries: [],
+    selectedCountry: loadVpnCountryPref()
+  }
 };
 
 let magicTimer = null;
 let accountMagicTimer = null;
+let vpnTimer = null;
 let inboxTimer = null;
 let smsTimer = null;
 let toastTimer = null;
-let lastFocusedTextTarget = null;
 
 function escapeHtml(value) {
   return String(value ?? "")
@@ -85,9 +96,6 @@ function randomChoice(items) {
 function generateIdentity() {
   state.firstName = randomChoice(FIRST_NAMES);
   state.lastName = randomChoice(LAST_NAMES);
-  updateBindingValue("first_name", state.firstName, false);
-  updateBindingValue("last_name", state.lastName, false);
-  saveBindings();
 }
 
 async function generateEmail() {
@@ -423,6 +431,7 @@ async function refreshSmsStatus() {
 
 async function openWolt(browser = "") {
   state.browserStatus = "opening";
+  state.fingerprint = null;
   render();
 
   try {
@@ -431,6 +440,7 @@ async function openWolt(browser = "") {
       body: JSON.stringify({ browser })
     });
     state.browserStatus = `${data.browser} ${data.private_mode}`;
+    state.fingerprint = data.fingerprint || null;
     showToast("Wolt opened");
   } catch (error) {
     state.browserStatus = error.message;
@@ -504,75 +514,95 @@ async function deleteAccount(email) {
   }
 }
 
-function loadBindings() {
+function loadVpnCountryPref() {
   try {
-    const saved = JSON.parse(
-      localStorage.getItem("woltmanual.bindings")
-      || localStorage.getItem("esd.woltmanual.bindings")
-      || "[]"
-    );
-    if (!Array.isArray(saved) || !saved.length) return DEFAULT_BINDINGS;
-    return DEFAULT_BINDINGS.map((binding) => ({
-      ...binding,
-      ...(saved.find((item) => item.id === binding.id) || {})
-    }));
+    return localStorage.getItem("woltmanual.vpn_country") || DEFAULT_VPN_COUNTRY;
   } catch {
-    return DEFAULT_BINDINGS;
+    return DEFAULT_VPN_COUNTRY;
   }
 }
 
-function saveBindings() {
-  localStorage.setItem("woltmanual.bindings", JSON.stringify(state.bindings));
-}
-
-function updateBindingValue(id, value, shouldRender = true) {
-  state.bindings = state.bindings.map((binding) => (
-    binding.id === id ? { ...binding, value } : binding
-  ));
-  saveBindings();
-  if (shouldRender) render();
-}
-
-function normalizeCombo(event) {
-  const key = event.key.length === 1 ? event.key.toUpperCase() : event.key;
-  return [
-    event.ctrlKey ? "Ctrl" : "",
-    event.altKey ? "Alt" : "",
-    event.shiftKey ? "Shift" : "",
-    event.metaKey ? "Meta" : "",
-    key
-  ].filter(Boolean).join("+");
-}
-
-function isTextTarget(element) {
-  if (!element) return false;
-  const tag = element.tagName;
-  return tag === "INPUT" || tag === "TEXTAREA" || element.isContentEditable;
-}
-
-async function useBinding(binding) {
-  const value = String(binding.value || "");
-  if (!value) {
-    showToast("Empty binding");
-    return;
+function saveVpnCountryPref(value) {
+  try {
+    localStorage.setItem("woltmanual.vpn_country", value);
+  } catch {
+    // ignore storage errors (e.g. private browsing restrictions)
   }
+}
 
-  const target = isTextTarget(document.activeElement) ? document.activeElement : lastFocusedTextTarget;
-  if (target && document.contains(target)) {
-    target.focus();
-    if (target.isContentEditable) {
-      document.execCommand("insertText", false, value);
-    } else {
-      const start = target.selectionStart ?? target.value.length;
-      const end = target.selectionEnd ?? target.value.length;
-      target.value = `${target.value.slice(0, start)}${value}${target.value.slice(end)}`;
-      target.selectionStart = target.selectionEnd = start + value.length;
-      target.dispatchEvent(new Event("input", { bubbles: true }));
-    }
+function applyVpnStatus(data) {
+  state.vpn.available = true;
+  state.vpn.connected = Boolean(data.connected);
+  state.vpn.status = data.status || (state.vpn.connected ? "Connected" : "Disconnected");
+  state.vpn.country = data.country || "";
+  state.vpn.city = data.city || "";
+  state.vpn.server = data.server || "";
+  state.vpn.hostname = data.hostname || "";
+  state.vpn.ip = data.ip || "";
+  state.vpn.error = "";
+}
+
+async function refreshVpnStatus() {
+  try {
+    const data = await api("/api/vpn/status");
+    applyVpnStatus(data);
+  } catch (error) {
+    state.vpn.available = !/not found/i.test(error.message || "");
+    state.vpn.connected = false;
+    state.vpn.status = "";
+    state.vpn.error = error.message;
+  } finally {
+    state.vpn.loaded = true;
+    render();
   }
+}
 
-  await navigator.clipboard.writeText(value);
-  showToast(`${binding.label} ready`);
+async function loadVpnCountries() {
+  try {
+    const data = await api("/api/vpn/countries");
+    state.vpn.countries = data.countries || [];
+  } catch {
+    state.vpn.countries = [{ id: DEFAULT_VPN_COUNTRY, name: DEFAULT_VPN_COUNTRY }];
+  } finally {
+    render();
+  }
+}
+
+async function vpnConnect() {
+  state.vpn.loading = true;
+  state.vpn.error = "";
+  render();
+
+  try {
+    const data = await api("/api/vpn/connect", {
+      method: "POST",
+      body: JSON.stringify({ country: state.vpn.selectedCountry || DEFAULT_VPN_COUNTRY })
+    });
+    applyVpnStatus(data);
+    showToast(`VPN connected: ${data.country || state.vpn.selectedCountry}`);
+  } catch (error) {
+    state.vpn.error = error.message;
+  } finally {
+    state.vpn.loading = false;
+    render();
+  }
+}
+
+async function vpnDisconnect() {
+  state.vpn.loading = true;
+  state.vpn.error = "";
+  render();
+
+  try {
+    const data = await api("/api/vpn/disconnect", { method: "POST" });
+    applyVpnStatus(data);
+    showToast("VPN disconnected");
+  } catch (error) {
+    state.vpn.error = error.message;
+  } finally {
+    state.vpn.loading = false;
+    render();
+  }
 }
 
 function stepClass(step) {
@@ -581,10 +611,55 @@ function stepClass(step) {
   return "step";
 }
 
+function vpnDotClass() {
+  if (!state.vpn.available) return "vpn-dot error";
+  if (state.vpn.loading) return "vpn-dot connecting";
+  return state.vpn.connected ? "vpn-dot connected" : "vpn-dot disconnected";
+}
+
+function vpnStatusText() {
+  if (!state.vpn.available) return state.vpn.error || "NordVPN not available";
+  if (state.vpn.loading) return "Reconnecting...";
+  if (state.vpn.connected) {
+    const location = [state.vpn.country, state.vpn.city].filter(Boolean).join(" · ");
+    return [location, state.vpn.ip].filter(Boolean).join(" — ") || "Connected";
+  }
+  return state.vpn.error || (state.vpn.loaded ? "Disconnected" : "Checking...");
+}
+
+function renderVpnCountryOptions() {
+  const countries = state.vpn.countries.length
+    ? state.vpn.countries
+    : [{ id: DEFAULT_VPN_COUNTRY, name: DEFAULT_VPN_COUNTRY }];
+  return countries.map((country) => {
+    const selected = country.id === state.vpn.selectedCountry ? "selected" : "";
+    return `<option value="${escapeHtml(country.id)}" ${selected}>${escapeHtml(country.name)}</option>`;
+  }).join("");
+}
+
+function renderVpnBar() {
+  const disableActions = state.vpn.loading || !state.vpn.available;
+  return `
+    <div class="vpn-bar">
+      <div class="vpn-status">
+        <span class="${vpnDotClass()}"></span>
+        <div class="vpn-info">
+          <strong>NordVPN</strong>
+          <span>${escapeHtml(vpnStatusText())}</span>
+        </div>
+      </div>
+      <div class="vpn-controls">
+        <select data-action="vpn-country" aria-label="VPN country" ${disableActions ? "disabled" : ""}>${renderVpnCountryOptions()}</select>
+        <button class="secondary" data-action="vpn-connect" ${disableActions ? "disabled" : ""}>Reconnect</button>
+        <button class="ghost" data-action="vpn-disconnect" ${disableActions || !state.vpn.connected ? "disabled" : ""}>Disconnect</button>
+      </div>
+    </div>
+  `;
+}
+
 function layout(content) {
   const toast = state.toast ? `<div class="toast">${escapeHtml(state.toast)}</div>` : "";
   const accountButtonClass = state.toolPanel === "accounts" ? "secondary active" : "secondary";
-  const bindingButtonClass = state.toolPanel === "bindings" ? "secondary active" : "secondary";
 
   return `
     <main class="shell">
@@ -596,12 +671,13 @@ function layout(content) {
         <div class="top-actions">
           <button class="secondary" data-action="open-wolt">Open Wolt</button>
           <button class="${accountButtonClass}" data-action="toggle-accounts">Accounts</button>
-          <button class="${bindingButtonClass}" data-action="toggle-bindings">Keybindings</button>
           <button class="secondary" data-action="restart">Restart</button>
         </div>
       </header>
 
+      ${renderVpnBar()}
       ${renderToolPanel()}
+      ${state.fingerprint ? renderFingerprint() : ""}
 
       <section class="page-area">
         <nav class="steps" aria-label="Steps">
@@ -914,7 +990,7 @@ function renderToolPanel() {
   if (!state.toolPanel) return "";
   return `
     <section class="tool-panel">
-      ${state.toolPanel === "accounts" ? renderAccountsPanel() : renderBindingsPanel()}
+      ${renderAccountsPanel()}
     </section>
   `;
 }
@@ -973,32 +1049,69 @@ function renderAccountsPanel() {
   `;
 }
 
-function renderBindingsPanel() {
-  const rows = state.bindings.map((binding) => `
-    <div class="binding-row">
-      <div class="binding-label">
-        <strong>${escapeHtml(binding.label)}</strong>
-        <span>${escapeHtml(binding.combo)}</span>
-      </div>
-      <input data-binding="${escapeHtml(binding.id)}" value="${escapeHtml(binding.value)}" placeholder="${escapeHtml(binding.label)}">
-      <button data-action="use-binding" data-id="${escapeHtml(binding.id)}">Use</button>
-    </div>
-  `).join("");
+function renderFingerprint() {
+  const fp = state.fingerprint;
+  if (!fp) return "";
+
+  const features = (fp.features_disabled || []).map((feat) =>
+    `<span class="chip">${escapeHtml(feat)}</span>`
+  ).join("");
+
+  const uaDisplay = fp.user_agent
+    ? fp.user_agent.length > 90
+      ? `${escapeHtml(fp.user_agent.slice(0, 87))}...`
+      : escapeHtml(fp.user_agent)
+    : "Firefox (resistFingerprinting)";
 
   return `
-    <div class="panel">
-      <div class="panel-header">
-        <div class="panel-title">Keybindings</div>
-        <button class="ghost" data-action="close-tools">Close</button>
+    <div class="fingerprint-panel">
+      <div class="fingerprint-header">
+        <div class="fingerprint-title">Browser fingerprint</div>
+        <button class="ghost" data-action="close-fingerprint" title="Dismiss">close</button>
       </div>
-      <div class="panel-body stack">
-        <div class="grid-2">
-          <button class="secondary" data-action="new-name">Generate name</button>
-          <button class="secondary" data-action="save-bindings">Save</button>
+      <div class="fingerprint-grid">
+        <div class="fp-item">
+          <div class="label">User agent</div>
+          <div class="fp-value" title="${escapeHtml(fp.user_agent || '')}">${uaDisplay}</div>
         </div>
-        <div class="binding-list">${rows}</div>
-        <div class="status-line">Active while this app is focused. Values are copied to clipboard and inserted into the focused field when possible.</div>
-        ${state.browserStatus ? `<div class="value-box">${escapeHtml(state.browserStatus)}</div>` : ""}
+        <div class="fp-item">
+          <div class="label">Profile</div>
+          <div class="fp-value">${escapeHtml(fp.profile_dir)}</div>
+        </div>
+        <div class="fp-row">
+          <div class="fp-item narrow">
+            <div class="label">Window</div>
+            <div class="fp-value">${fp.width}x${fp.height}</div>
+          </div>
+          <div class="fp-item narrow">
+            <div class="label">Position</div>
+            <div class="fp-value">${fp.pos_x},${fp.pos_y}</div>
+          </div>
+          <div class="fp-item narrow">
+            <div class="label">Language</div>
+            <div class="fp-value">${escapeHtml(fp.lang)}</div>
+          </div>
+        </div>
+        <div class="fp-row">
+          <div class="fp-item narrow">
+            <div class="label">WebGL</div>
+            <div class="fp-value ${fp.gl_renderer.toLowerCase().includes('disabled') ? 'warn' : ''}">${escapeHtml(fp.gl_renderer)}</div>
+          </div>
+          <div class="fp-item narrow">
+            <div class="label">WebRTC</div>
+            <div class="fp-value ${fp.webrtc_policy.toLowerCase().includes('disable') || fp.webrtc_policy === 'disabled' ? 'ok' : ''}">${escapeHtml(fp.webrtc_policy)}</div>
+          </div>
+          <div class="fp-item narrow">
+            <div class="label">Canvas read</div>
+            <div class="fp-value ok">${fp.canvas_blocked ? "blocked" : "allowed"}</div>
+          </div>
+        </div>
+        ${features ? `
+          <div class="fp-item">
+            <div class="label">Features disabled</div>
+            <div class="fp-chips">${features}</div>
+          </div>
+        ` : ""}
       </div>
     </div>
   `;
@@ -1021,15 +1134,15 @@ function bindActions() {
       }
       render();
     });
-    if (action === "toggle-bindings") element.addEventListener("click", () => {
-      state.toolPanel = state.toolPanel === "bindings" ? "" : "bindings";
-      render();
-    });
     if (action === "close-tools") element.addEventListener("click", () => {
       state.toolPanel = "";
       state.accountMagicExpandedEmail = "";
       state.accountDeleteConfirmEmail = "";
       stopAccountMagicPolling();
+      render();
+    });
+    if (action === "close-fingerprint") element.addEventListener("click", () => {
+      state.fingerprint = null;
       render();
     });
     if (action === "new-email") element.addEventListener("click", async () => {
@@ -1041,10 +1154,6 @@ function bindActions() {
       render();
     });
     if (action === "set-default-provider") element.addEventListener("click", () => setDefaultEmailProvider(element.dataset.provider));
-    if (action === "new-name") element.addEventListener("click", () => {
-      generateIdentity();
-      render();
-    });
     if (action === "copy-email") element.addEventListener("click", async () => {
       await copyText(state.email, "Email copied");
       await saveCurrentAccount({ status: "generated" });
@@ -1094,17 +1203,6 @@ function bindActions() {
       render();
     });
     if (action === "confirm-delete-account") element.addEventListener("click", () => deleteAccount(element.dataset.email));
-    if (action === "use-binding") element.addEventListener("click", () => {
-      const binding = state.bindings.find((item) => item.id === element.dataset.id);
-      if (binding) useBinding(binding);
-    });
-    if (action === "save-bindings") element.addEventListener("click", () => {
-      document.querySelectorAll("[data-binding]").forEach((input) => {
-        updateBindingValue(input.dataset.binding, input.value, false);
-      });
-      saveBindings();
-      showToast("Saved");
-    });
     if (action === "country") element.addEventListener("change", (event) => {
       state.country = event.target.value;
       state.activationId = "";
@@ -1115,16 +1213,16 @@ function bindActions() {
       clearInterval(smsTimer);
       loadSmsSummary();
     });
+    if (action === "vpn-country") element.addEventListener("change", (event) => {
+      state.vpn.selectedCountry = event.target.value;
+      saveVpnCountryPref(state.vpn.selectedCountry);
+    });
+    if (action === "vpn-connect") element.addEventListener("click", vpnConnect);
+    if (action === "vpn-disconnect") element.addEventListener("click", vpnDisconnect);
   });
 
   document.querySelectorAll("[data-copy]").forEach((element) => {
     element.addEventListener("click", () => copyText(element.dataset.copy, "Copied"));
-  });
-
-  document.querySelectorAll("[data-binding]").forEach((input) => {
-    input.addEventListener("input", (event) => {
-      updateBindingValue(event.target.dataset.binding, event.target.value, false);
-    });
   });
 }
 
@@ -1141,22 +1239,11 @@ function render() {
   bindActions();
 }
 
-document.addEventListener("focusin", (event) => {
-  if (isTextTarget(event.target)) lastFocusedTextTarget = event.target;
-});
-
-document.addEventListener("keydown", (event) => {
-  const combo = normalizeCombo(event);
-  const binding = state.bindings.find((item) => item.combo === combo);
-  if (!binding) return;
-  event.preventDefault();
-  useBinding(binding);
-});
-
 async function init() {
   render();
-  await Promise.all([loadConfig(), loadCountries(), loadAccounts()]);
+  await Promise.all([loadConfig(), loadCountries(), loadAccounts(), loadVpnCountries(), refreshVpnStatus()]);
   render();
+  vpnTimer = setInterval(refreshVpnStatus, 20000);
 }
 
 init();
