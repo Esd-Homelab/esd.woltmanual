@@ -95,8 +95,36 @@ async fn api_request(
     }
 }
 
+struct ServiceLock(PathBuf);
+impl Drop for ServiceLock {
+    fn drop(&mut self) {
+        if fs::read_to_string(&self.0).ok().as_deref() == Some(&std::process::id().to_string()) {
+            let _ = fs::remove_file(&self.0);
+        }
+    }
+}
 pub fn run() {
     tauri::Builder::default()
+        .setup(|app| {
+            let data_dir = resolve_data_dir(app.handle());
+            fs::create_dir_all(&data_dir)?;
+            let lock = data_dir.join(".wolt-service-lock");
+            if lock.exists() {
+                let pid = fs::read_to_string(&lock)?.trim().to_string();
+                if Path::new(&format!("/proc/{pid}")).exists() {
+                    return Err("Woltmanual data is already owned by another running application".into());
+                }
+                fs::remove_file(&lock)?;
+            }
+            use std::io::Write;
+            let mut file = fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&lock)?;
+            write!(file, "{}", std::process::id())?;
+            app.manage(ServiceLock(lock));
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![api_request])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
@@ -673,7 +701,7 @@ fn value_to_text(value: &Value) -> String {
 }
 
 fn resolve_data_dir(app: &AppHandle) -> PathBuf {
-    if let Ok(root) = env::var("ESD_WOLTMANUAL_ROOT") {
+    if let Ok(root) = env::var("WOLT_DATA_DIR").or_else(|_| env::var("ESD_WOLTMANUAL_ROOT")) {
         return PathBuf::from(root);
     }
 

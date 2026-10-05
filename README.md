@@ -51,3 +51,13 @@ Set `default_email_provider` to either `testmail` or `tempmail`. `email_provider
 Generated accounts are stored in `accounts.json`.
 
 The Wolt button launches a private Firefox or Chromium window when either browser is installed.
+
+## Desktop hub integration
+
+The sibling `esd.hub` workspace embeds the existing interface through the Node HTTP transport. Embedded mode uses HTTP even inside a Tauri parent, while standalone Tauri continues to use its native API. An opt-in bridge captures transient workflow state and pauses/resumes pollers during native-window handoff.
+
+`npm run web` binds to loopback port 5137 (`PORT` overrides it) and exposes `/health`. It supports the desktop VPN status/countries/connect/disconnect actions through the local NordVPN CLI and refuses cross-origin control requests. `WOLT_DATA_DIR` overrides the existing root data location for both transports; `ESD_WOLTMANUAL_ROOT` remains supported. A `.wolt-service-lock` prevents concurrent standalone and HTTP writers. Linux is the validated platform for this shared lock.
+
+Hub tests use `WOLT_MOCK=1` only with temporary synthetic configuration/account directories. It substitutes HTTP API responses, including SMS/VPN actions. Ordinary launches use the existing real configuration and APIs. Validation includes JS syntax, Rust `cargo check`, isolated HTTP/origin/competing-writer checks, and active-phone workflow handoff in browser and both native hosts.
+
+The existing workflow was published in baseline `62b6035`; the hub adapter is published separately. The hub's user-local menu installer can route this application's entry into the shared workspace.

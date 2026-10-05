@@ -148,7 +148,7 @@ async function setDefaultEmailProvider(provider) {
 }
 
 function tauriInvoke() {
-  return window.__TAURI__?.core?.invoke;
+  return new URLSearchParams(location.search).get("hub") === "1" ? null : window.__TAURI__?.core?.invoke;
 }
 
 async function api(path, options = {}) {
@@ -1240,10 +1240,35 @@ function render() {
 }
 
 async function init() {
+  const saved = await window.hubIntegration?.initial;
   render();
-  await Promise.all([loadConfig(), loadCountries(), loadAccounts(), loadVpnCountries(), refreshVpnStatus()]);
+  await Promise.all([
+    loadConfig(),
+    loadCountries(),
+    loadAccounts(),
+    loadVpnCountries(),
+    refreshVpnStatus(),
+  ]);
   render();
+  if (saved?.app) Object.assign(state, saved.app);
+  setStep(state.step);
   vpnTimer = setInterval(refreshVpnStatus, 20000);
+  window.hubIntegration?.install({
+    capture: () => {
+      const { config, accounts, countries, ...session } = state;
+      return session;
+    },
+    pause: () => {
+      clearPollers();
+      clearInterval(vpnTimer);
+    },
+    resume: () => {
+      setStep(state.step);
+      clearInterval(vpnTimer);
+      vpnTimer = setInterval(refreshVpnStatus, 20000);
+    },
+  });
+  window.hubIntegration?.restoreForms(saved);
 }
 
 init();

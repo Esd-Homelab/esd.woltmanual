@@ -1,13 +1,15 @@
 const http = require("http");
 const fs = require("fs/promises");
+const fsSync = require("fs");
 const path = require("path");
 const { spawn, spawnSync } = require("child_process");
 const { URL, URLSearchParams } = require("url");
 
 const ROOT_DIR = __dirname;
 const PUBLIC_DIR = path.join(ROOT_DIR, "public");
-const CONFIG_PATH = path.join(ROOT_DIR, "config.json");
-const ACCOUNTS_PATH = path.join(ROOT_DIR, "accounts.json");
+const DATA_DIR = process.env.WOLT_DATA_DIR || process.env.ESD_WOLTMANUAL_ROOT || ROOT_DIR;
+const CONFIG_PATH = path.join(DATA_DIR, "config.json");
+const ACCOUNTS_PATH = path.join(DATA_DIR, "accounts.json");
 const HERO_BASE = "https://hero-sms.com/stubs/handler_api.php";
 const TESTMAIL_BASE = "https://api.testmail.app/api/json";
 const DEFAULT_EMAIL_PROVIDER = "testmail";
@@ -16,6 +18,49 @@ const RAPIDAPI_TEMPMAIL_BASE = `https://${RAPIDAPI_TEMPMAIL_HOST}`;
 const WOLT_SERVICE = "rr";
 const PORT = Number(process.env.PORT || 5137);
 const WOLT_URL = "https://wolt.com";
+
+// One writer across the standalone desktop and HTTP service.
+fsSync.mkdirSync(DATA_DIR, { recursive: true });
+const SERVICE_LOCK = path.join(DATA_DIR, ".wolt-service-lock");
+try {
+  fsSync.writeFileSync(SERVICE_LOCK, String(process.pid), {
+    flag: "wx",
+    mode: 0o600,
+  });
+} catch (error) {
+  if (error.code !== "EEXIST") throw error;
+  const pid = Number(fsSync.readFileSync(SERVICE_LOCK, "utf8"));
+  let alive = true;
+  try {
+    process.kill(pid, 0);
+  } catch {
+    alive = false;
+  }
+  if (alive)
+    throw new Error(
+      "Woltmanual data is already owned by another running application.",
+    );
+  fsSync.unlinkSync(SERVICE_LOCK);
+  fsSync.writeFileSync(SERVICE_LOCK, String(process.pid), {
+    flag: "wx",
+    mode: 0o600,
+  });
+}
+function releaseLock() {
+  try {
+    if (fsSync.readFileSync(SERVICE_LOCK, "utf8") === String(process.pid))
+      fsSync.unlinkSync(SERVICE_LOCK);
+  } catch {}
+}
+process.on("exit", releaseLock);
+process.on("SIGTERM", () => {
+  releaseLock();
+  process.exit(0);
+});
+process.on("SIGINT", () => {
+  releaseLock();
+  process.exit(0);
+});
 
 const COUNTRY_DIAL_CODES = {
   1: "380",
@@ -652,7 +697,7 @@ function launchPrivateBrowser(preferred) {
 
   if (browser.kind === "firefox") {
     const profileDir = fingerprintProfileDir();
-    fs.mkdirSync(profileDir, { recursive: true });
+    fsSync.mkdirSync(profileDir, { recursive: true });
 
     const prefs = [
       `user_pref("privacy.fingerprintingProtection", true);`,
@@ -676,7 +721,7 @@ function launchPrivateBrowser(preferred) {
       `user_pref("network.http.referer.XOriginPolicy", 1);`
     ];
 
-    fs.writeFileSync(`${profileDir}/user.js`, prefs.join("\n") + "\n");
+    fsSync.writeFileSync(`${profileDir}/user.js`, prefs.join("\n") + "\n");
 
     const [width, height] = randomViewport();
     const [posX, posY] = randomPosition();
@@ -717,7 +762,7 @@ function launchPrivateBrowser(preferred) {
   }
 
   const profileDir = fingerprintProfileDir();
-  fs.mkdirSync(profileDir, { recursive: true });
+  fsSync.mkdirSync(profileDir, { recursive: true });
 
   const userAgent = randomUserAgent();
   const [width, height] = randomViewport();
@@ -1151,16 +1196,111 @@ async function serveStatic(res, requestPath) {
   }
 }
 
-const server = http.createServer(async (req, res) => {
-  const parsedUrl = new URL(req.url, `http://${req.headers.host || "localhost"}`);
-
-  if (parsedUrl.pathname.startsWith("/api/")) {
-    return handleApi(req, res, parsedUrl);
+async function runVpn(args) {
+  return new Promise((resolve, reject) => {
+    const child = spawn("nordvpn", args, {stdio:["ignore","pipe","pipe"]});
+    let text = ""; child.stdout.on("data",chunk=>text+=chunk); child.stderr.on("data",chunk=>text+=chunk);
+    const timer=setTimeout(()=>child.kill(),15000);
+    child.on("error",reject); child.on("close",code=>{clearTimeout(timer); if(code===0)resolve(text.trim());else reject(new Error(text.trim() || "NordVPN command failed"));});
+  });
+}
+async function vpnStatus() {
+  const text=await runVpn(["status"]);
+  const fields=Object.fromEntries(text.split("\n").filter(line=>line.includes(":")).map(line=>{const index=line.indexOf(":");return [line.slice(0,index).trim().toLowerCase(),line.slice(index+1).trim()];}));
+  return {success:true,connected:fields.status==="Connected",status:fields.status||"Disconnected",country:fields.country||"",city:fields.city||"",server:fields["current server"]||"",hostname:fields.hostname||"",ip:fields["your new ip"]||fields.ip||""};
+}
+async function vpnApi(req, res, url) {
+  try {
+    if (url.pathname === "/api/vpn/status")
+      return sendJson(res, 200, await vpnStatus());
+    if (url.pathname === "/api/vpn/countries") {
+      const text = await runVpn(["countries"]);
+      return sendJson(res, 200, {
+        success: true,
+        countries: text
+          .split(/\s+/)
+          .filter(Boolean)
+          .map((id) => ({ id, name: id.replaceAll("_", " ") })),
+      });
+    }
+    if (req.method !== "POST")
+      return sendJson(res, 405, { success: false, error: "POST required" });
+    if (url.pathname === "/api/vpn/connect") {
+      const body = await readJsonBody(req);
+      const country = String(body.country || "Denmark");
+      if (!/^[A-Za-z_ ]{1,80}$/.test(country))
+        throw new Error("Invalid VPN country");
+      await runVpn(["connect", country]);
+    } else if (url.pathname === "/api/vpn/disconnect")
+      await runVpn(["disconnect"]);
+    else return sendJson(res, 404, { success: false, error: "Not found" });
+    return sendJson(res, 200, await vpnStatus());
+  } catch (error) {
+    return sendJson(res, 200, { success: false, error: error.message });
   }
-
+}
+const server = http.createServer(async (req, res) => {
+  const parsedUrl = new URL(
+    req.url,
+    `http://${req.headers.host || "localhost"}`,
+  );
+  if (parsedUrl.pathname === "/health")
+    return sendJson(res, 200, {
+      ok: true,
+      application: "woltmanual",
+      production: true,
+    });
+  if (req.headers.origin && req.headers.origin !== `http://${req.headers.host}`)
+    return sendJson(res, 403, { success: false, error: "Origin not allowed" });
+  if (process.env.WOLT_MOCK === "1" && parsedUrl.pathname.startsWith("/api/")) {
+    const routes = {
+      "/api/config": {
+        success: true,
+        email_provider: "testmail",
+        default_email_provider: "testmail",
+        testmail_namespace: "fixture",
+        has_sms_api_key: true,
+        missing: [],
+      },
+      "/api/accounts": { success: true, accounts: [] },
+      "/api/sms/countries": {
+        success: true,
+        countries: [{ id: 172, name: "Denmark", dialCode: "45" }],
+      },
+      "/api/vpn/countries": {
+        success: true,
+        countries: [{ id: "Denmark", name: "Denmark" }],
+      },
+      "/api/vpn/status": {
+        success: true,
+        status: "Disconnected",
+        connected: false,
+      },
+      "/api/email/emails": { success: true, emails: [] },
+      "/api/email/magic-link": { success: true, magic_link: "" },
+      "/api/sms/request-number": {
+        success: true,
+        activation_id: "fixture-activation",
+        phone_number: "4512345678",
+        local_phone_number: "12345678",
+      },
+    };
+    return sendJson(
+      res,
+      200,
+      routes[parsedUrl.pathname] || {
+        success: true,
+        status: "waiting",
+        balance: 10,
+      },
+    );
+  }
+  if (parsedUrl.pathname.startsWith("/api/vpn/"))
+    return vpnApi(req, res, parsedUrl);
+  if (parsedUrl.pathname.startsWith("/api/"))
+    return handleApi(req, res, parsedUrl);
   return serveStatic(res, parsedUrl.pathname);
 });
-
-server.listen(PORT, "127.0.0.1", () => {
-  console.log(`esd.woltmanual running at http://127.0.0.1:${PORT}`);
-});
+server.listen(PORT, "127.0.0.1", () =>
+  console.log(`esd.woltmanual running at http://127.0.0.1:${PORT}`),
+);
